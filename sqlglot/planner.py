@@ -156,8 +156,13 @@ class Step:
             step.operands = tuple(alias(operand, alias_) for operand, alias_ in operands.items())
             step.aggregations = list(aggregations)
 
+        window_expressions: list[exp.Expr] = []
+
         for e in expression.expressions:
-            if find_in_scope(e, exp.AggFunc):
+            if e.find(exp.Window):
+                window_expressions.append(e)
+                projections.append(exp.column(e.alias_or_name, step.name, quoted=True))
+            elif find_in_scope(e, exp.AggFunc):
                 projections.append(exp.column(e.alias_or_name, step.name, quoted=True))
                 extract_agg_operands(e)
             else:
@@ -212,6 +217,27 @@ class Step:
             step = aggregate
         else:
             aggregate = None
+
+        if window_expressions:
+            window_step = Window()
+            window_step.name = step.name
+            window_step.source = step.name
+            window_step.windows = window_expressions
+            qualify_node: exp.Qualify | None = expression.args.get("qualify")
+            if qualify_node is not None:
+                window_step.qualify = qualify_node.this
+            window_step.add_dependency(step)
+            step = window_step
+        else:
+            qualify_node2: exp.Qualify | None = expression.args.get("qualify")
+            if qualify_node2 is not None:
+                qualify_step = Window()
+                qualify_step.name = step.name
+                qualify_step.source = step.name
+                qualify_step.windows = []
+                qualify_step.qualify = qualify_node2.this
+                qualify_step.add_dependency(step)
+                step = qualify_step
 
         # Plan DISTINCT before ORDER BY, since Aggregate sorts by its own group key
         if isinstance(expression, exp.Select) and expression.args.get("distinct"):
@@ -455,6 +481,24 @@ class Sort(Step):
         for expression in self.key:  # type: ignore
             lines.append(f"{indent}  - {expression.sql()}")
 
+        return lines
+
+
+class Window(Step):
+    def __init__(self) -> None:
+        super().__init__()
+        self.source: str | None = None
+        self.windows: list[exp.Expr] = []
+        self.qualify: exp.Expr | None = None
+
+    def _to_s(self, indent: str) -> list[str]:
+        lines = [f"{indent}Source: {self.source}"]
+        if self.windows:
+            lines.append(f"{indent}Windows:")
+            for w in self.windows:
+                lines.append(f"{indent}  - {w.sql()}")
+        if self.qualify:
+            lines.append(f"{indent}Qualify: {self.qualify.sql()}")
         return lines
 
 

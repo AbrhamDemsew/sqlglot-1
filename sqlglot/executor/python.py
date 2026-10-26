@@ -61,6 +61,8 @@ class PythonExecutor:
                     contexts[node] = self.join(node, context)
                 elif isinstance(node, planner.Sort):
                     contexts[node] = self.sort(node, context)
+                elif isinstance(node, planner.Window):
+                    contexts[node] = self.window(node, context)
                 elif isinstance(node, planner.SetOperation):
                     contexts[node] = self.set_operation(node, context)
                 else:
@@ -514,6 +516,342 @@ class PythonExecutor:
 
         output = Table(projection_columns or context.columns, rows=rows)
         return self.context({step.name: output})
+
+    def window(self, step, context):
+        source_table = context.tables[step.source]
+        rows = list(source_table.rows)
+        source_cols = list(source_table.columns)
+
+        window_results: dict[str, list] = {}
+        for win_expr in step.windows:
+            alias_name = win_expr.alias_or_name
+            win_node = win_expr.find(exp.Window)
+            if win_node is None:
+                continue
+            window_results[alias_name] = self._eval_window(
+                win_node, rows, source_table, source_cols, context
+            )
+
+        new_cols = source_cols + list(window_results)
+        out_table = Table(new_cols)
+        for i, row in enumerate(rows):
+            new_row = row + tuple(window_results[c][i] for c in window_results)
+            out_table.append(new_row)
+
+        if step.qualify is not None:
+            qualify_expr = step.qualify.copy()
+            extra_wins: dict[str, list] = {}
+            for node in qualify_expr.walk():
+                if isinstance(node, exp.Window):
+                    tmp_col = f"__q_{len(extra_wins)}"
+                    extra_wins[tmp_col] = self._eval_window(
+                        node, rows, source_table, source_cols, context
+                    )
+                    node.replace(exp.column(tmp_col, step.name, quoted=True))
+
+            all_cols = new_cols + list(extra_wins)
+            aug_table = Table(all_cols)
+            for i, row in enumerate(out_table.rows):
+                extra_vals = tuple(extra_wins[c][i] for c in extra_wins)
+                aug_table.append(row + extra_vals)
+
+            qual_ctx = self.context({step.name: aug_table})
+            qualify_code = self.generate(qualify_expr)
+            kept_rows = []
+            for reader, ctx in qual_ctx:
+                if ctx.eval(qualify_code):
+                    kept_rows.append(reader.row[: len(new_cols)])
+            out_table = Table(new_cols, kept_rows)
+
+        if step.projections:
+            proj_ctx = self.context(
+                {step.name: out_table, **{name: out_table for name in context.tables}}
+            )
+            proj_table = self.table(step.projections)
+            proj_codes = self.generate_tuple(step.projections)
+            for reader, ctx in proj_ctx:
+                proj_table.append(ctx.eval_tuple(proj_codes))
+            return self.context({step.name: proj_table})
+
+        return self.context({step.name: out_table})
+
+    def _eval_window(self, win_node, rows, source_table, source_cols, context):
+        n = len(rows)
+        func = win_node.this
+        partition_exprs = win_node.args.get("partition_by") or []
+        order_node = win_node.args.get("order")
+        order_exprs = order_node.expressions if order_node else []
+        spec = win_node.args.get("spec")
+
+        def make_row_ctx(row):
+            tbl = Table(source_cols, [row])
+            return self.context({source_table.name or win_node.args.get("alias"): tbl,
+                                  **{n: Table(source_cols, [row]) for n in context.tables}})
+
+        def eval_expr_on_row(expr, row):
+            ctx = self.context(
+                {name: Table(source_cols, [row]) for name in context.tables}
+            )
+            ctx.set_index(0)
+            code = self.generate(expr)
+            return ctx.eval(code) if code else None
+
+        def eval_col(expr, row_idx):
+            row = rows[row_idx]
+            tbl_name = next(iter(context.tables), None)
+            if tbl_name is None:
+                return None
+            tbl = Table(source_cols, [row])
+            ctx = self.context({tbl_name: tbl})
+            ctx.set_index(0)
+            code = self.generate(expr)
+            return ctx.eval(code) if code else None
+
+        def get_part_key(row_idx):
+            row = rows[row_idx]
+            tbl_name = next(iter(context.tables), None)
+            if not partition_exprs or tbl_name is None:
+                return ()
+            tbl = Table(source_cols, [row])
+            ctx = self.context({tbl_name: tbl})
+            ctx.set_index(0)
+            return tuple(
+                ctx.eval(self.generate(e)) if self.generate(e) else None
+                for e in partition_exprs
+            )
+
+        def get_order_vals(row_idx):
+            row = rows[row_idx]
+            tbl_name = next(iter(context.tables), None)
+            if not order_exprs or tbl_name is None:
+                return ()
+            tbl = Table(source_cols, [row])
+            ctx = self.context({tbl_name: tbl})
+            ctx.set_index(0)
+            vals = []
+            for oe in order_exprs:
+                code = self.generate(oe.this)
+                vals.append(ctx.eval(code) if code else None)
+            return tuple(vals)
+
+        from sqlglot.executor.env import ordered as _ordered
+
+        def sort_key_for(row_idx):
+            row = rows[row_idx]
+            tbl_name = next(iter(context.tables), None)
+            if tbl_name is None:
+                return ()
+            tbl = Table(source_cols, [row])
+            ctx = self.context({tbl_name: tbl})
+            ctx.set_index(0)
+            key_parts = []
+            for oe in order_exprs:
+                desc = bool(oe.args.get("desc"))
+                nulls_first = bool(oe.args.get("nulls_first"))
+                code = self.generate(oe.this)
+                v = ctx.eval(code) if code else None
+                key_parts.append(_ordered(v, desc, nulls_first))
+            return tuple(key_parts)
+
+        partitions: dict[tuple, list[int]] = {}
+        for i in range(n):
+            k = get_part_key(i)
+            partitions.setdefault(k, []).append(i)
+
+        results: list = [None] * n
+
+        for part_indices in partitions.values():
+            sorted_indices = sorted(part_indices, key=sort_key_for)
+            order_vals_list = [get_order_vals(i) for i in sorted_indices]
+
+            def frame_bounds(pos, sorted_part):
+                if spec is None:
+                    if order_exprs:
+                        kind = "RANGE"
+                        start_val, start_side = "UNBOUNDED", "PRECEDING"
+                        end_val, end_side = "CURRENT ROW", None
+                    else:
+                        return 0, len(sorted_part) - 1
+                else:
+                    kind = spec.args.get("kind", "RANGE")
+                    start_val = spec.args.get("start")
+                    start_side = spec.args.get("start_side")
+                    end_val = spec.args.get("end")
+                    end_side = spec.args.get("end_side")
+
+                ov = order_vals_list[pos]
+
+                def resolve_bound(val, side, is_start):
+                    if val == "UNBOUNDED":
+                        return 0 if is_start else len(sorted_part) - 1
+                    if val == "CURRENT ROW" or (val is None and side is None):
+                        if kind == "ROWS":
+                            return pos
+                        lo, hi = pos, pos
+                        while lo > 0 and order_vals_list[lo - 1] == ov:
+                            lo -= 1
+                        while hi < len(sorted_part) - 1 and order_vals_list[hi + 1] == ov:
+                            hi += 1
+                        return lo if is_start else hi
+                    if kind == "ROWS":
+                        offset = int(val.name) if hasattr(val, "name") else int(val)
+                        if side == "PRECEDING":
+                            return max(0, pos - offset)
+                        return min(len(sorted_part) - 1, pos + offset)
+                    numeric_offset = float(val.name) if hasattr(val, "name") else float(val)
+                    if not ov or len(ov) != 1:
+                        return 0 if is_start else len(sorted_part) - 1
+                    cur = ov[0]
+                    if cur is None:
+                        lo2, hi2 = pos, pos
+                        while lo2 > 0 and order_vals_list[lo2 - 1] == ov:
+                            lo2 -= 1
+                        while hi2 < len(sorted_part) - 1 and order_vals_list[hi2 + 1] == ov:
+                            hi2 += 1
+                        return lo2 if is_start else hi2
+                    desc = bool(order_exprs[0].args.get("desc")) if order_exprs else False
+                    if side == "PRECEDING":
+                        bound_val = cur - numeric_offset if not desc else cur + numeric_offset
+                    else:
+                        bound_val = cur + numeric_offset if not desc else cur - numeric_offset
+                    if side == "PRECEDING":
+                        idx = 0
+                        for j, ov2 in enumerate(order_vals_list):
+                            v2 = ov2[0] if ov2 else None
+                            if v2 is None:
+                                continue
+                            if (not desc and v2 >= bound_val) or (desc and v2 <= bound_val):
+                                idx = j
+                                break
+                        else:
+                            idx = len(sorted_part) - 1 if not is_start else 0
+                        return idx if is_start else idx
+                    else:
+                        idx = len(sorted_part) - 1
+                        for j in range(len(sorted_part) - 1, -1, -1):
+                            ov2 = order_vals_list[j]
+                            v2 = ov2[0] if ov2 else None
+                            if v2 is None:
+                                continue
+                            if (not desc and v2 <= bound_val) or (desc and v2 >= bound_val):
+                                idx = j
+                                break
+                        return idx
+
+                s = resolve_bound(start_val, start_side, True)
+                e = resolve_bound(end_val, end_side, False)
+                return min(s, e), max(s, e)
+
+            def get_frame_values(pos, col_expr, sorted_part):
+                lo, hi = frame_bounds(pos, sorted_part)
+                vals = []
+                tbl_name = next(iter(context.tables), None)
+                if tbl_name is None:
+                    return vals
+                for j in range(lo, hi + 1):
+                    orig_idx = sorted_part[j]
+                    row = rows[orig_idx]
+                    tbl = Table(source_cols, [row])
+                    ctx = self.context({tbl_name: tbl})
+                    ctx.set_index(0)
+                    code = self.generate(col_expr)
+                    vals.append(ctx.eval(code) if code else None)
+                return vals
+
+            for pos, orig_idx in enumerate(sorted_indices):
+                if isinstance(func, exp.RowNumber):
+                    results[orig_idx] = pos + 1
+
+                elif isinstance(func, exp.Rank):
+                    ov = order_vals_list[pos]
+                    count_before = sum(1 for j in range(pos) if order_vals_list[j] != ov)
+                    results[orig_idx] = count_before + 1
+
+                elif isinstance(func, exp.DenseRank):
+                    ov = order_vals_list[pos]
+                    seen_distinct: list = []
+                    for j in range(pos):
+                        prev = order_vals_list[j]
+                        if prev != ov and prev not in seen_distinct:
+                            seen_distinct.append(prev)
+                    results[orig_idx] = len(seen_distinct) + 1
+
+                elif isinstance(func, (exp.Lag, exp.Lead)):
+                    offset_expr = func.args.get("offset")
+                    default_expr = func.args.get("default")
+                    offset = 1
+                    if offset_expr is not None:
+                        tbl_name = next(iter(context.tables), None)
+                        if tbl_name:
+                            row = rows[orig_idx]
+                            tbl = Table(source_cols, [row])
+                            ctx = self.context({tbl_name: tbl})
+                            ctx.set_index(0)
+                            code = self.generate(offset_expr)
+                            offset = ctx.eval(code) if code else 1
+                    default = None
+                    if default_expr is not None:
+                        tbl_name = next(iter(context.tables), None)
+                        if tbl_name:
+                            row = rows[orig_idx]
+                            tbl = Table(source_cols, [row])
+                            ctx = self.context({tbl_name: tbl})
+                            ctx.set_index(0)
+                            code = self.generate(default_expr)
+                            default = ctx.eval(code) if code else None
+                    target_pos = pos - offset if isinstance(func, exp.Lag) else pos + offset
+                    if 0 <= target_pos < len(sorted_indices):
+                        tbl_name = next(iter(context.tables), None)
+                        if tbl_name:
+                            row = rows[sorted_indices[target_pos]]
+                            tbl = Table(source_cols, [row])
+                            ctx = self.context({tbl_name: tbl})
+                            ctx.set_index(0)
+                            code = self.generate(func.this)
+                            results[orig_idx] = ctx.eval(code) if code else None
+                        else:
+                            results[orig_idx] = default
+                    else:
+                        results[orig_idx] = default
+
+                elif isinstance(func, exp.FirstValue):
+                    vals = get_frame_values(pos, func.this, sorted_indices)
+                    results[orig_idx] = next((v for v in vals), None)
+
+                elif isinstance(func, exp.LastValue):
+                    vals = get_frame_values(pos, func.this, sorted_indices)
+                    results[orig_idx] = next((v for v in reversed(vals)), None)
+
+                elif isinstance(func, exp.Count):
+                    col_expr = func.this
+                    if isinstance(col_expr, exp.Star):
+                        lo, hi = frame_bounds(pos, sorted_indices)
+                        results[orig_idx] = hi - lo + 1
+                    else:
+                        vals = get_frame_values(pos, col_expr, sorted_indices)
+                        results[orig_idx] = sum(1 for v in vals if v is not None)
+
+                elif isinstance(func, exp.Sum):
+                    vals = get_frame_values(pos, func.this, sorted_indices)
+                    non_null = [v for v in vals if v is not None]
+                    results[orig_idx] = sum(non_null) if non_null else None
+
+                elif isinstance(func, exp.Avg):
+                    vals = get_frame_values(pos, func.this, sorted_indices)
+                    non_null = [v for v in vals if v is not None]
+                    results[orig_idx] = sum(non_null) / len(non_null) if non_null else None
+
+                elif isinstance(func, exp.Min):
+                    vals = get_frame_values(pos, func.this, sorted_indices)
+                    non_null = [v for v in vals if v is not None]
+                    results[orig_idx] = min(non_null) if non_null else None
+
+                elif isinstance(func, exp.Max):
+                    vals = get_frame_values(pos, func.this, sorted_indices)
+                    non_null = [v for v in vals if v is not None]
+                    results[orig_idx] = max(non_null) if non_null else None
+
+        return results
 
     def set_operation(self, step, context):
         left = context.tables[step.left]
